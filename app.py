@@ -4,6 +4,7 @@
 import streamlit as st
 import pandas as pd
 from excel_preprocess import ask
+from tools_sql_agent import run_agent
 # ---- Import your ask() function here ----
 # from your_existing_module import ask
 
@@ -31,7 +32,8 @@ if st.button("Submit") and user_q:
         st.stop()  # stops execution for this session
 
     try:
-        df_ans = ask(user_q)
+        # df_ans = ask(user_q)
+        df_ans = run_agent(user_q)
         st.subheader("Answer")
         st.dataframe(df_ans)
     except Exception as e:

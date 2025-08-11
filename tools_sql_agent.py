@@ -9,10 +9,46 @@ from typing import Dict, Any, List, Optional, Tuple
 import duckdb
 import pandas as pd
 import sqlglot
+import datetime as dt
+import decimal
+import numpy as np
+
 
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+
+
+def _json_default(obj):
+    # Datetimes / dates / times
+    if isinstance(obj, (pd.Timestamp, dt.datetime, dt.date, dt.time)):
+        return obj.isoformat()
+    # Decimals
+    if isinstance(obj, decimal.Decimal):
+        return float(obj)
+    # numpy scalars
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    # NaNs
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+    # Fallback
+    return str(obj)
+
+def df_to_chart_json(df: pd.DataFrame) -> Dict[str, Any]:
+    # Build rows with Python-native, JSON-safe values
+    rows = []
+    for row in df.itertuples(index=False, name=None):
+        rows.append([_json_default(v) for v in row])
+    return {"columns": list(df.columns), "rows": rows}
 
 # -------------------------------
 # DB connection (DuckDB local)
@@ -23,6 +59,15 @@ CON = duckdb.connect("expenses.duckdb")  # your DB with table(s)/view(s)
 # Utils
 # -------------------------------
 FENCED_SQL_RE = re.compile(r"```(?:\s*sql)?\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
+
+def prune_history(messages: list, max_turns: int = 6):
+    """
+    Keep the System message + the last `max_turns` user/assistant/tool turns.
+    """
+    sys = [m for m in messages if isinstance(m, SystemMessage)]
+    rest = [m for m in messages if not isinstance(m, SystemMessage)]
+    pruned = sys[:1] + rest[-(max_turns*3):]  # rough cap (user/assistant/tool per turn)
+    return pruned
 
 def clean_sql(text: str) -> str:
     s = text.strip()
@@ -135,7 +180,7 @@ def sql_query(sql: str, page: int = 1, page_size: int = 50) -> str:
         "sql_source": source,
         "sql_effective": effective,
     })
-    return json.dumps(payload, ensure_ascii=False)
+    return json.dumps(payload, ensure_ascii=False, default=_json_default)
 
 # -------------------------------
 # Minimal agent loop (tool-calling)
@@ -154,30 +199,93 @@ PROMPT = ChatPromptTemplate.from_messages([
 ])
 LLM = ChatOpenAI(model="gpt-4o-mini", temperature=0).bind_tools(TOOLS)
 
+
+# --- add these imports ---
 def run_agent(question: str, page: int = 1, page_size: int = 50, max_steps: int = 4) -> str:
     """
     Let the model call tools; if it plans SQL, we pass page/page_size.
     """
     messages = PROMPT.format_messages(question=question)
+
     for _ in range(max_steps):
         ai = LLM.invoke(messages)
-        if not getattr(ai, "tool_calls", None):
+
+        # If the model did not call tools, we're done.
+        tool_calls = getattr(ai, "tool_calls", None)
+        if not tool_calls:
             return ai.content
 
-        # Execute tool calls and append results
-        for call in ai.tool_calls:
-            name = call["name"]
-            args = call.get("args") or {}
-            if name == "schema_describe":
+        # Append the assistant message that requested tools
+        messages.append(ai)
+
+        # Execute each tool call and append a ToolMessage with tool_call_id
+        for call in tool_calls:
+            # Handle both dict- and attr-style tool call objects
+            tc_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+            tc_name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+            tc_args = call.get("args") if isinstance(call, dict) else getattr(call, "args", {}) or {}
+
+            if tc_name == "schema_describe":
                 result = schema_describe.invoke({})
-            elif name == "sql_query":
-                # inject pagination defaults if LLM didn't provide
-                args.setdefault("page", page)
-                args.setdefault("page_size", page_size)
-                result = sql_query.invoke(args)
+            elif tc_name == "sql_query":
+                tc_args.setdefault("page", page)
+                tc_args.setdefault("page_size", page_size)
+                result = sql_query.invoke(tc_args)
             else:
-                result = json.dumps({"error": f"Unknown tool {name}"})
-            messages.append(ai)
-            messages.append({"role": "tool", "name": name, "content": result})
+                # Unknown tool safeguard
+                result = json.dumps({"error": f"Unknown tool: {tc_name}"})
+
+            # Append the tool result with the REQUIRED tool_call_id
+            messages.append(ToolMessage(content=result, tool_call_id=tc_id, name=tc_name))
 
     return "Stopped after max tool steps. Refine the question or adjust parameters."
+
+SYSTEM_MESSAGE = SystemMessage(content=AGENT_SYSTEM)
+
+def run_agent_with_history(
+    history: list,                 # list[BaseMessage]: System/Human/AI/Tool
+    user_text: str,
+    page: int = 1,
+    page_size: int = 50,
+    max_steps: int = 4,
+):
+    """
+    Continue a conversation given `history` and a new user message.
+    Returns (updated_history, final_text).
+    """
+    # Start from prior messages; append the new Human turn
+    messages = list(history) + [HumanMessage(content=user_text)]
+
+    for _ in range(max_steps):
+        ai = LLM.invoke(messages)
+        tool_calls = getattr(ai, "tool_calls", None)
+
+        if not tool_calls:
+            # Final assistant turn; append and return
+            messages.append(ai)
+            return messages, ai.content
+
+        # Append the assistant message with tool_calls
+        messages.append(ai)
+
+        # Execute tools and append ToolMessage per call (must include tool_call_id)
+        for call in tool_calls:
+            tc_id  = call.get("id")   if isinstance(call, dict) else getattr(call, "id", None)
+            tc_name= call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+            tc_args= call.get("args") if isinstance(call, dict) else getattr(call, "args", {}) or {}
+
+            if tc_name == "schema_describe":
+                result = schema_describe.invoke({})
+            elif tc_name == "sql_query":
+                tc_args.setdefault("page", page)
+                tc_args.setdefault("page_size", page_size)
+                result = sql_query.invoke(tc_args)
+            else:
+                result = json.dumps({"error": f"Unknown tool: {tc_name}"})
+
+            messages.append(ToolMessage(content=result, tool_call_id=tc_id, name=tc_name))
+
+    # If we hit max_steps without a final answer:
+    messages.append(AIMessage(content="Stopped after max tool steps."))
+    messages = prune_history(messages, max_turns=6)
+    return messages, "Stopped after max tool steps."
