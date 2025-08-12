@@ -4,6 +4,7 @@
 import json
 import pandas as pd
 import streamlit as st
+import inspect, traceback, json
 
 # ---- import your tool-driven agent bits ----
 from tools_sql_agent import (
@@ -11,6 +12,9 @@ from tools_sql_agent import (
     run_agent_with_history,
     sql_query,  # tool to run raw SQL (returns JSON)
 )
+from langchain_core.messages import messages_to_dict
+
+st.sidebar.markdown("---")
 
 # -------------------------
 # auto-charting helper (Altair)

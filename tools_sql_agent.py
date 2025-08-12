@@ -17,7 +17,8 @@ import numpy as np
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, AnyMessage
+
 
 
 def _json_default(obj):
@@ -119,6 +120,7 @@ def table_info(name: str) -> Optional[str]:
     except Exception:
         return None
 
+
 # -------------------------------
 # Tools
 # -------------------------------
@@ -200,7 +202,7 @@ PROMPT = ChatPromptTemplate.from_messages([
 LLM = ChatOpenAI(model="gpt-4o-mini", temperature=0).bind_tools(TOOLS)
 
 
-# --- add these imports ---
+
 def run_agent(question: str, page: int = 1, page_size: int = 50, max_steps: int = 4) -> str:
     """
     Let the model call tools; if it plans SQL, we pass page/page_size.
@@ -260,14 +262,13 @@ def run_agent_with_history(
         ai = LLM.invoke(messages)
         tool_calls = getattr(ai, "tool_calls", None)
 
+        messages.append(ai)
         if not tool_calls:
             # Final assistant turn; append and return
-            messages.append(ai)
             return messages, ai.content
 
-        # Append the assistant message with tool_calls
-        messages.append(ai)
 
+        # which category has the 4th largest expense
         # Execute tools and append ToolMessage per call (must include tool_call_id)
         for call in tool_calls:
             tc_id  = call.get("id")   if isinstance(call, dict) else getattr(call, "id", None)
